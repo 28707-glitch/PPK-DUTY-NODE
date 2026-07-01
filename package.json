@@ -1,7 +1,7 @@
 {
   "name": "ppk-duty-node-backend",
-  "version": "4.0.0",
-  "description": "PPK Duty Node.js backend with Socket.IO realtime support; admin is system-only and never stored in users",
+  "version": "5.0.0",
+  "description": "PPK Duty Node.js backend with Socket.IO realtime support; admin is system-only; mobile camera or image attachment proof supported",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

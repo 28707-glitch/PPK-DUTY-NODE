@@ -1,29 +1,8 @@
-# PPK Duty Node Backend V4
+# Render Backend V5
 
-อัปโหลดไฟล์ `server.js` และ `package.json` ทับใน GitHub repo ที่ผูกกับ Render
+อัปโหลดไฟล์นี้ไปแทนที่ใน GitHub repo ที่ Render ใช้อยู่:
 
-## แก้สำคัญ
+- server.js
+- package.json
 
-- แอดมินไม่อยู่ใน `users` แล้ว
-- สมัคร/ล็อกอินจะไม่สร้างแอดมินเป็นนักเรียน
-- `users` เหลือเฉพาะบัญชีนักเรียน
-- บัญชี demo ปิดค่าเริ่มต้น
-
-## Render
-
-```text
-Build Command: npm install
-Start Command: npm start
-```
-
-## Admin
-
-```text
-admin / admin1234
-```
-
-เปลี่ยนรหัสแอดมินได้ด้วย Environment Variable:
-
-```text
-ADMIN_PASSWORD=รหัสใหม่
-```
+V5 แก้ backend ให้รับรูปหลักฐานจากมือถือ/แนบไฟล์ได้ ไม่บังคับ `captureMode === camera` แบบเดิมแล้ว

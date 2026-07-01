@@ -281,13 +281,19 @@ function emitChange({ dateKey, grade, room, type = "appDataChanged", record = nu
   }
 }
 
-function isValidCameraJpeg(photoDataUrl) {
+function isValidProofImage(photoDataUrl) {
   if (typeof photoDataUrl !== "string") return false;
-  if (!photoDataUrl.startsWith("data:image/jpeg;base64,")) return false;
+  if (!/^data:image\/(jpeg|jpg|png|webp);base64,/i.test(photoDataUrl)) return false;
   const base64 = photoDataUrl.split(",")[1] || "";
   if (base64.length < 10000) return false;
   if (base64.length > 18000000) return false;
   return true;
+}
+
+function normalizeCaptureMode(value) {
+  const mode = clean(value);
+  const allowed = new Set(["mobile_camera", "gallery_upload", "photo_file", "attachment", "camera"]);
+  return allowed.has(mode) ? mode : "photo_file";
 }
 
 async function handleAction(body = {}) {
@@ -430,10 +436,9 @@ async function handleAction(body = {}) {
     const recordId = clean(body.recordId);
     const note = clean(body.note).slice(0, 300);
     const photoDataUrl = body.photoDataUrl;
-    const captureMode = clean(body.captureMode);
+    const captureMode = normalizeCaptureMode(body.captureMode);
 
-    if (captureMode !== "camera") throw new Error("ต้องถ่ายรูปจากกล้องในเว็บเท่านั้น");
-    if (!isValidCameraJpeg(photoDataUrl)) throw new Error("รูปไม่ถูกต้อง ต้องเป็น JPEG จากกล้องและมีขนาดเหมาะสม");
+    if (!isValidProofImage(photoDataUrl)) throw new Error("รูปไม่ถูกต้อง ต้องเป็นไฟล์รูปภาพที่มีขนาดเหมาะสม");
 
     const record = records.find((r) => r.recordId === recordId);
     if (!record) throw new Error("ไม่พบข้อมูลเวร");
@@ -444,7 +449,7 @@ async function handleAction(body = {}) {
     record.note = note;
     record.photoUrl = photoDataUrl;
     record.status = "done";
-    record.captureMode = "camera";
+    record.captureMode = captureMode;
     record.captureClientAt = clean(body.captureClientAt);
     record.cameraMeta = body.cameraMeta || {};
     record.submittedAt = now;
