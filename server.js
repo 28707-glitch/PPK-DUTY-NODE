@@ -11,9 +11,11 @@ const PORT = process.env.PORT || 3000;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "*";
 const ADMIN_ID = process.env.ADMIN_ID || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin1234";
+const ADMIN_SESSION_ID = "__system_admin__";
+const SEED_DEMO = String(process.env.SEED_DEMO || "false").toLowerCase() === "true";
 
 app.use(cors({ origin: CLIENT_ORIGIN }));
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: "25mb", type: "*/*" }));
 
 const io = new Server(server, {
   cors: {
@@ -23,7 +25,7 @@ const io = new Server(server, {
 });
 
 // -----------------------------------------------------------------------------
-// PPK Duty Node Backend — Render + Socket.IO version
+// PPK Duty Node Backend — Render + Socket.IO version V4
 // หมายเหตุ: เวอร์ชันนี้เก็บข้อมูลใน memory เพื่อให้เริ่มใช้ฟรีได้ทันที
 // ถ้า Render restart / redeploy / sleep แล้วตื่นใหม่ ข้อมูลอาจหายได้
 // ใช้งานจริงถาวรควรต่อ Supabase/Firebase เพิ่มในขั้นต่อไป
@@ -38,38 +40,36 @@ const settings = {
   maxUsersPerRoom: 60
 };
 
-const users = [
-  {
-    userId: "admin",
-    studentId: ADMIN_ID,
-    password: ADMIN_PASSWORD,
-    name: "ผู้ดูแลระบบ",
-    grade: "",
-    room: "",
-    role: "admin",
-    active: true
-  },
-  {
-    userId: "u_demo_10001",
-    studentId: "10001",
-    password: "1234",
-    name: "นักเรียนทดสอบ 1",
-    grade: "6",
-    room: "1",
-    role: "student",
-    active: true
-  },
-  {
-    userId: "u_demo_10002",
-    studentId: "10002",
-    password: "1234",
-    name: "นักเรียนทดสอบ 2",
-    grade: "6",
-    room: "1",
-    role: "student",
-    active: true
-  }
-];
+// เก็บเฉพาะบัญชีนักเรียนเท่านั้น
+// สำคัญ: แอดมินไม่อยู่ใน users array เพื่อไม่ให้ไปโผล่ในรายชื่อนักเรียน/การสมัคร/การจัดการบัญชี
+const users = [];
+
+// เปิดบัญชีทดสอบเฉพาะเมื่อ Render Environment Variable: SEED_DEMO=true
+// ค่าเริ่มต้นคือ false เพื่อไม่ให้ระบบสร้างบัญชีแปลกปลอมเอง
+if (SEED_DEMO) {
+  users.push(
+    {
+      userId: "u_demo_10001",
+      studentId: "10001",
+      password: "1234",
+      name: "นักเรียนทดสอบ 1",
+      grade: "6",
+      room: "1",
+      role: "student",
+      active: true
+    },
+    {
+      userId: "u_demo_10002",
+      studentId: "10002",
+      password: "1234",
+      name: "นักเรียนทดสอบ 2",
+      grade: "6",
+      room: "1",
+      role: "student",
+      active: true
+    }
+  );
+}
 
 let records = [];
 const dutyMap = new Map();
@@ -89,6 +89,22 @@ function id(prefix = "id") {
 
 function clean(v = "") {
   return String(v || "").trim();
+}
+
+function systemAdmin() {
+  return {
+    userId: ADMIN_SESSION_ID,
+    studentId: ADMIN_ID,
+    name: "ผู้ดูแลระบบ",
+    grade: "",
+    room: "",
+    role: "admin",
+    active: true
+  };
+}
+
+function isAdminLogin(loginId) {
+  return clean(loginId).toLowerCase() === clean(ADMIN_ID).toLowerCase();
 }
 
 function todayKey(date = new Date()) {
@@ -124,14 +140,15 @@ function publicUser(u) {
 
 function createToken(user) {
   const token = crypto.randomBytes(24).toString("hex");
-  sessions.set(token, { userId: user.userId, createdAt: Date.now() });
+  sessions.set(token, { userId: user.userId, role: user.role, createdAt: Date.now() });
   return token;
 }
 
 function auth(token) {
   const s = sessions.get(clean(token));
   if (!s) return null;
-  const u = users.find((item) => item.userId === s.userId && item.active !== false);
+  if (s.userId === ADMIN_SESSION_ID || s.role === "admin") return systemAdmin();
+  const u = users.find((item) => item.userId === s.userId && item.active !== false && item.role === "student");
   return u || null;
 }
 
@@ -189,7 +206,7 @@ function getRecords({ dateKey, grade = "", room = "" } = {}) {
 function getUsers({ grade = "", room = "" } = {}) {
   return users.filter((u) => {
     if (u.active === false) return false;
-    if (u.role === "admin") return true;
+    if (u.role !== "student") return false;
     if (grade && String(u.grade) !== String(grade)) return false;
     if (room && String(u.room) !== String(room)) return false;
     return true;
@@ -279,7 +296,17 @@ async function handleAction(body = {}) {
   if (action === "login") {
     const loginId = clean(body.loginId || body.studentId || body.username);
     const password = String(body.password || "");
-    const user = users.find((u) => u.active !== false && String(u.studentId) === loginId && String(u.password) === password);
+
+    // แอดมินเป็นบัญชีระบบ ไม่ใช่แถวนักเรียน จึงไม่ถูกสร้าง/แสดงใน users
+    if (isAdminLogin(loginId)) {
+      if (password !== ADMIN_PASSWORD) throw new Error("รหัสผ่านผู้ดูแลระบบไม่ถูกต้อง");
+      const admin = systemAdmin();
+      const token = createToken(admin);
+      return { ok: true, token, user: publicUser(admin), settings: { ...settings } };
+    }
+
+    const studentId = loginId.replace(/\D/g, "");
+    const user = users.find((u) => u.active !== false && u.role === "student" && String(u.studentId) === studentId && String(u.password) === password);
     if (!user) throw new Error("เลขประจำตัวหรือรหัสผ่านไม่ถูกต้อง");
     const token = createToken(user);
     return { ok: true, token, user: publicUser(user), settings: { ...settings } };
@@ -293,7 +320,9 @@ async function handleAction(body = {}) {
     const password = String(body.password || "");
 
     if (!name || !studentId || !grade || !room || !password) throw new Error("กรุณากรอกข้อมูลสมัครให้ครบ");
-    if (users.some((u) => u.active !== false && u.studentId === studentId)) throw new Error("เลขประจำตัวนี้มีบัญชีแล้ว");
+    if (!/^\d{1,10}$/.test(studentId)) throw new Error("เลขประจำตัวนักเรียนต้องเป็นตัวเลขเท่านั้น");
+    if (isAdminLogin(body.studentId || body.loginId || body.username)) throw new Error("เลขประจำตัวนี้ถูกสงวนไว้สำหรับผู้ดูแลระบบ");
+    if (users.some((u) => u.active !== false && u.role === "student" && u.studentId === studentId)) throw new Error("เลขประจำตัวนี้มีบัญชีแล้ว");
 
     const countInRoom = users.filter((u) => u.active !== false && u.role === "student" && u.grade === grade && u.room === room).length;
     if (countInRoom >= Number(settings.maxUsersPerRoom || 60)) throw new Error("ห้องนี้มีสมาชิกครบตามจำนวนที่ตั้งไว้แล้ว");
@@ -511,6 +540,9 @@ async function handleAction(body = {}) {
     return { ok: true, removed: removed.length };
   }
 
+  if (!action) {
+    throw new Error("ไม่พบ action ในคำขอ: เว็บอาจยังไม่ได้ส่ง JSON หรือใช้ไฟล์ app.js ตัวเก่า");
+  }
   throw new Error("ไม่รู้จัก action: " + action);
 }
 
@@ -520,7 +552,9 @@ app.get("/", (req, res) => {
     name: "PPK Duty Node Backend",
     realtime: "Socket.IO ready",
     status: "running",
-    api: "Apps Script compatible action API ready"
+    api: "Apps Script compatible action API ready",
+    version: "4.0.0-no-admin-in-users",
+    adminStorage: "system-only"
   });
 });
 
