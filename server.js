@@ -3,6 +3,8 @@ const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
 const crypto = require("crypto");
+const { Readable } = require("stream");
+const { google } = require("googleapis");
 
 const app = express();
 const server = http.createServer(app);
@@ -13,6 +15,14 @@ const ADMIN_ID = process.env.ADMIN_ID || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin1234";
 const ADMIN_SESSION_ID = "__system_admin__";
 const SEED_DEMO = String(process.env.SEED_DEMO || "false").toLowerCase() === "true";
+
+// ใส่ค่าเริ่มต้นตามลิงก์ที่ผู้ใช้ให้มา แต่ยังสามารถ override ใน Render Environment ได้
+const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID || "1aUNaQZy5M5xGKcyMjT4bjHfT5aZxwVMM81bflfb4jFI";
+const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID || "1HGh0iEjxu33dokLxCy74EHqmlAm3_37m";
+const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL || "";
+const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY || "";
+const GOOGLE_CREDENTIALS_JSON = process.env.GOOGLE_CREDENTIALS_JSON || "";
+const ENABLE_GOOGLE_STORAGE = String(process.env.ENABLE_GOOGLE_STORAGE || "true").toLowerCase() !== "false";
 
 app.use(cors({ origin: CLIENT_ORIGIN }));
 app.use(express.json({ limit: "25mb", type: "*/*" }));
@@ -25,10 +35,10 @@ const io = new Server(server, {
 });
 
 // -----------------------------------------------------------------------------
-// PPK Duty Node Backend — Render + Socket.IO version V4
-// หมายเหตุ: เวอร์ชันนี้เก็บข้อมูลใน memory เพื่อให้เริ่มใช้ฟรีได้ทันที
-// ถ้า Render restart / redeploy / sleep แล้วตื่นใหม่ ข้อมูลอาจหายได้
-// ใช้งานจริงถาวรควรต่อ Supabase/Firebase เพิ่มในขั้นต่อไป
+// PPK Duty Node Backend — V6 Google Sheets + Drive persistent storage
+// - Users / Records / Duties / Settings อยู่ใน Google Sheets
+// - รูปหลักฐานอยู่ใน Google Drive แล้วเก็บ photoUrl/photoFileId ในชีต
+// - Socket.IO ยังใช้ส่งข้อมูลแบบ real-time เหมือนเดิม
 // -----------------------------------------------------------------------------
 
 const settings = {
@@ -40,37 +50,8 @@ const settings = {
   maxUsersPerRoom: 60
 };
 
-// เก็บเฉพาะบัญชีนักเรียนเท่านั้น
-// สำคัญ: แอดมินไม่อยู่ใน users array เพื่อไม่ให้ไปโผล่ในรายชื่อนักเรียน/การสมัคร/การจัดการบัญชี
+// แอดมินไม่อยู่ใน users array เพื่อไม่ให้โผล่เป็นนักเรียน
 const users = [];
-
-// เปิดบัญชีทดสอบเฉพาะเมื่อ Render Environment Variable: SEED_DEMO=true
-// ค่าเริ่มต้นคือ false เพื่อไม่ให้ระบบสร้างบัญชีแปลกปลอมเอง
-if (SEED_DEMO) {
-  users.push(
-    {
-      userId: "u_demo_10001",
-      studentId: "10001",
-      password: "1234",
-      name: "นักเรียนทดสอบ 1",
-      grade: "6",
-      room: "1",
-      role: "student",
-      active: true
-    },
-    {
-      userId: "u_demo_10002",
-      studentId: "10002",
-      password: "1234",
-      name: "นักเรียนทดสอบ 2",
-      grade: "6",
-      room: "1",
-      role: "student",
-      active: true
-    }
-  );
-}
-
 let records = [];
 const dutyMap = new Map();
 const sessions = new Map();
@@ -83,12 +64,34 @@ const defaultDuties = [
   { emoji: "🪑", name: "จัดโต๊ะเก้าอี้", slots: 2 }
 ];
 
+const SHEET_HEADERS = {
+  Users: ["userId", "studentId", "password", "name", "grade", "room", "role", "active", "createdAt", "updatedAt"],
+  Records: ["recordId", "dateKey", "grade", "room", "userId", "studentId", "userName", "dutyId", "dutyName", "emoji", "status", "note", "photoUrl", "photoFileId", "captureMode", "captureClientAt", "cameraMetaJson", "selectedAt", "submittedAt", "reviewedAt", "updatedAt"],
+  Duties: ["dutyId", "grade", "room", "emoji", "name", "slots"],
+  Settings: ["key", "value"]
+};
+
+let sheetsClient = null;
+let driveClient = null;
+let googleStorageReady = false;
+let googleInitError = "";
+
 function id(prefix = "id") {
   return `${prefix}_${Date.now()}_${crypto.randomBytes(5).toString("hex")}`;
 }
 
 function clean(v = "") {
   return String(v || "").trim();
+}
+
+function boolText(value) {
+  return value ? "TRUE" : "FALSE";
+}
+
+function parseBool(value, defaultValue = true) {
+  const s = clean(value).toLowerCase();
+  if (!s) return defaultValue;
+  return !(s === "false" || s === "0" || s === "no" || s === "inactive");
 }
 
 function systemAdmin() {
@@ -164,6 +167,248 @@ function requireAdmin(token) {
   return u;
 }
 
+function rowToObject(headers, row) {
+  const obj = {};
+  headers.forEach((h, i) => obj[h] = row[i] === undefined ? "" : row[i]);
+  return obj;
+}
+
+function normalizePrivateKey(key) {
+  return clean(key).replace(/\\n/g, "\n");
+}
+
+function credentialsFromEnv() {
+  if (GOOGLE_CREDENTIALS_JSON) {
+    try {
+      const raw = Buffer.from(GOOGLE_CREDENTIALS_JSON, "base64").toString("utf8");
+      const parsed = JSON.parse(raw);
+      if (parsed.private_key) parsed.private_key = normalizePrivateKey(parsed.private_key);
+      return parsed;
+    } catch (_) {
+      const parsed = JSON.parse(GOOGLE_CREDENTIALS_JSON);
+      if (parsed.private_key) parsed.private_key = normalizePrivateKey(parsed.private_key);
+      return parsed;
+    }
+  }
+
+  if (!GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY) return null;
+  return {
+    client_email: GOOGLE_SERVICE_ACCOUNT_EMAIL,
+    private_key: normalizePrivateKey(GOOGLE_PRIVATE_KEY)
+  };
+}
+
+async function initGoogleClients() {
+  if (!ENABLE_GOOGLE_STORAGE) {
+    googleInitError = "Google storage disabled by ENABLE_GOOGLE_STORAGE=false";
+    return false;
+  }
+
+  try {
+    const credentials = credentialsFromEnv();
+    if (!credentials) {
+      googleInitError = "ยังไม่ได้ตั้ง GOOGLE_SERVICE_ACCOUNT_EMAIL / GOOGLE_PRIVATE_KEY หรือ GOOGLE_CREDENTIALS_JSON ใน Render";
+      return false;
+    }
+
+    const authClient = new google.auth.GoogleAuth({
+      credentials,
+      scopes: [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.file"
+      ]
+    });
+
+    sheetsClient = google.sheets({ version: "v4", auth: authClient });
+    driveClient = google.drive({ version: "v3", auth: authClient });
+    googleStorageReady = true;
+    return true;
+  } catch (err) {
+    googleStorageReady = false;
+    googleInitError = err.message || String(err);
+    console.error("Google init failed:", googleInitError);
+    return false;
+  }
+}
+
+async function ensureSheetTabs() {
+  if (!googleStorageReady) return;
+  const meta = await sheetsClient.spreadsheets.get({ spreadsheetId: GOOGLE_SHEET_ID });
+  const existing = new Set((meta.data.sheets || []).map(s => s.properties.title));
+  const requests = [];
+  Object.keys(SHEET_HEADERS).forEach(title => {
+    if (!existing.has(title)) requests.push({ addSheet: { properties: { title } } });
+  });
+  if (requests.length) {
+    await sheetsClient.spreadsheets.batchUpdate({ spreadsheetId: GOOGLE_SHEET_ID, requestBody: { requests } });
+  }
+
+  for (const [title, headers] of Object.entries(SHEET_HEADERS)) {
+    const current = await readRange(`${title}!1:1`);
+    const firstRow = current[0] || [];
+    const needHeader = !firstRow.length || headers.some((h, i) => firstRow[i] !== h);
+    if (needHeader) {
+      await sheetsClient.spreadsheets.values.update({
+        spreadsheetId: GOOGLE_SHEET_ID,
+        range: `${title}!1:1`,
+        valueInputOption: "RAW",
+        requestBody: { values: [headers] }
+      });
+    }
+  }
+}
+
+async function readRange(range) {
+  const res = await sheetsClient.spreadsheets.values.get({ spreadsheetId: GOOGLE_SHEET_ID, range });
+  return res.data.values || [];
+}
+
+async function writeSheet(title, headers, rows) {
+  if (!googleStorageReady) return;
+  const values = [headers, ...rows];
+  await sheetsClient.spreadsheets.values.clear({ spreadsheetId: GOOGLE_SHEET_ID, range: `${title}!A:Z` });
+  await sheetsClient.spreadsheets.values.update({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `${title}!A1`,
+    valueInputOption: "RAW",
+    requestBody: { values }
+  });
+}
+
+async function loadFromSheets() {
+  if (!googleStorageReady) return;
+
+  await ensureSheetTabs();
+
+  users.splice(0, users.length);
+  records = [];
+  dutyMap.clear();
+
+  const userRows = (await readRange("Users!A2:J")).filter(r => r.some(cell => clean(cell)));
+  for (const row of userRows) {
+    const o = rowToObject(SHEET_HEADERS.Users, row);
+    // กันกรณีมี admin เคยหลุดเข้า sheet เดิม
+    if (!o.studentId || isAdminLogin(o.studentId) || clean(o.role) === "admin") continue;
+    users.push({
+      userId: clean(o.userId) || id("u"),
+      studentId: clean(o.studentId).replace(/\D/g, ""),
+      password: String(o.password || ""),
+      name: clean(o.name),
+      grade: clean(o.grade),
+      room: clean(o.room),
+      role: "student",
+      active: parseBool(o.active, true),
+      createdAt: clean(o.createdAt),
+      updatedAt: clean(o.updatedAt)
+    });
+  }
+
+  const recordRows = (await readRange("Records!A2:U")).filter(r => r.some(cell => clean(cell)));
+  for (const row of recordRows) {
+    const o = rowToObject(SHEET_HEADERS.Records, row);
+    if (!o.recordId) continue;
+    let cameraMeta = {};
+    try { cameraMeta = o.cameraMetaJson ? JSON.parse(o.cameraMetaJson) : {}; } catch (_) {}
+    records.push({
+      recordId: clean(o.recordId),
+      dateKey: normalizeDateKey(o.dateKey),
+      grade: clean(o.grade),
+      room: clean(o.room),
+      userId: clean(o.userId),
+      studentId: clean(o.studentId),
+      userName: clean(o.userName),
+      dutyId: clean(o.dutyId),
+      dutyName: clean(o.dutyName),
+      emoji: clean(o.emoji) || "📌",
+      status: clean(o.status) || "assigned",
+      note: clean(o.note),
+      photoUrl: clean(o.photoUrl),
+      photoFileId: clean(o.photoFileId),
+      captureMode: clean(o.captureMode),
+      captureClientAt: clean(o.captureClientAt),
+      cameraMeta,
+      selectedAt: clean(o.selectedAt),
+      submittedAt: clean(o.submittedAt),
+      reviewedAt: clean(o.reviewedAt),
+      updatedAt: clean(o.updatedAt)
+    });
+  }
+
+  const dutyRows = (await readRange("Duties!A2:F")).filter(r => r.some(cell => clean(cell)));
+  for (const row of dutyRows) {
+    const o = rowToObject(SHEET_HEADERS.Duties, row);
+    const grade = clean(o.grade);
+    const room = clean(o.room);
+    const name = clean(o.name);
+    if (!grade || !room || !name) continue;
+    const key = roomDutyKey(grade, room);
+    if (!dutyMap.has(key)) dutyMap.set(key, []);
+    dutyMap.get(key).push({
+      dutyId: clean(o.dutyId) || `d_${grade}_${room}_${dutyMap.get(key).length + 1}`,
+      grade,
+      room,
+      emoji: clean(o.emoji) || "📌",
+      name,
+      slots: Math.max(1, Math.min(99, Number(o.slots || 1)))
+    });
+  }
+
+  const settingRows = (await readRange("Settings!A2:B")).filter(r => clean(r[0]));
+  for (const row of settingRows) {
+    const key = clean(row[0]);
+    const value = row[1];
+    if (settings[key] === undefined) continue;
+    if (["openHour", "openMinute", "closeHour", "closeMinute", "maxUsersPerRoom"].includes(key)) settings[key] = Number(value);
+    else settings[key] = clean(value);
+  }
+
+  if (SEED_DEMO && !users.some(u => u.studentId === "10001")) {
+    users.push(
+      { userId: "u_demo_10001", studentId: "10001", password: "1234", name: "นักเรียนทดสอบ 1", grade: "6", room: "1", role: "student", active: true, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+      { userId: "u_demo_10002", studentId: "10002", password: "1234", name: "นักเรียนทดสอบ 2", grade: "6", room: "1", role: "student", active: true, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+    );
+    await saveUsers();
+  }
+
+  console.log(`Loaded from Google Sheets: users=${users.length}, records=${records.length}, dutyRooms=${dutyMap.size}`);
+}
+
+async function saveUsers() {
+  await writeSheet("Users", SHEET_HEADERS.Users, users
+    .filter(u => u.role === "student" && !isAdminLogin(u.studentId))
+    .map(u => [u.userId, u.studentId, u.password, u.name, u.grade, u.room, "student", boolText(u.active !== false), u.createdAt || "", u.updatedAt || ""]));
+}
+
+async function saveRecords() {
+  await writeSheet("Records", SHEET_HEADERS.Records, records.map(r => [
+    r.recordId, r.dateKey, r.grade, r.room, r.userId, r.studentId, r.userName,
+    r.dutyId, r.dutyName, r.emoji, r.status, r.note || "", r.photoUrl || "", r.photoFileId || "",
+    r.captureMode || "", r.captureClientAt || "", JSON.stringify(r.cameraMeta || {}),
+    r.selectedAt || "", r.submittedAt || "", r.reviewedAt || "", r.updatedAt || ""
+  ]));
+}
+
+async function saveDuties() {
+  const rows = [];
+  dutyMap.forEach((list) => {
+    list.forEach(d => rows.push([d.dutyId, d.grade, d.room, d.emoji || "📌", d.name, d.slots || 1]));
+  });
+  await writeSheet("Duties", SHEET_HEADERS.Duties, rows);
+}
+
+async function saveSettings() {
+  await writeSheet("Settings", SHEET_HEADERS.Settings, Object.entries(settings).map(([key, value]) => [key, String(value)]));
+}
+
+async function persist(kind) {
+  if (!googleStorageReady) return;
+  if (kind === "users") return saveUsers();
+  if (kind === "records") return saveRecords();
+  if (kind === "duties") return saveDuties();
+  if (kind === "settings") return saveSettings();
+  await Promise.all([saveUsers(), saveRecords(), saveDuties(), saveSettings()]);
+}
+
 function getDutiesForRoom(grade, room) {
   const key = roomDutyKey(grade, room);
   if (!dutyMap.has(key)) {
@@ -175,6 +420,8 @@ function getDutiesForRoom(grade, room) {
       name: d.name,
       slots: d.slots
     })));
+    // ไม่ await ตรงนี้ เพื่อไม่ให้การอ่านข้อมูลช้า แต่จะบันทึกทันทีถ้าเชื่อม Google พร้อม
+    persist("duties").catch(err => console.error("save duties failed:", err.message));
   }
   return dutyMap.get(key);
 }
@@ -188,7 +435,6 @@ function knownRooms() {
     const [grade, room] = key.split("|");
     if (grade && room) map.set(key, { grade, room });
   });
-  // ให้ห้อง ม.6/1 โผล่ทันทีสำหรับทดสอบ แม้ยังไม่มีใครสมัครเพิ่ม
   map.set(roomDutyKey("6", "1"), { grade: "6", room: "1" });
   return Array.from(map.values()).sort((a, b) => `${a.grade}/${a.room}`.localeCompare(`${b.grade}/${b.room}`, "th", { numeric: true }));
 }
@@ -258,6 +504,12 @@ function appDataFor(user, params = {}) {
     duties,
     progress: progressFor(recs),
     scope: { dateKey, grade, room },
+    storage: {
+      mode: googleStorageReady ? "google-sheets-drive" : "memory-fallback",
+      sheetId: GOOGLE_SHEET_ID,
+      driveFolderId: GOOGLE_DRIVE_FOLDER_ID,
+      error: googleStorageReady ? "" : googleInitError
+    },
     serverTime: new Date().toISOString()
   };
 }
@@ -290,6 +542,53 @@ function isValidProofImage(photoDataUrl) {
   return true;
 }
 
+function parseDataUrl(photoDataUrl) {
+  const match = String(photoDataUrl || "").match(/^data:(image\/(jpeg|jpg|png|webp));base64,(.+)$/i);
+  if (!match) throw new Error("รูปไม่ถูกต้อง");
+  const mimeType = match[1].toLowerCase().replace("image/jpg", "image/jpeg");
+  const ext = mimeType === "image/png" ? "png" : mimeType === "image/webp" ? "webp" : "jpg";
+  const buffer = Buffer.from(match[3], "base64");
+  return { mimeType, ext, buffer };
+}
+
+async function uploadProofToDrive({ photoDataUrl, record, user }) {
+  if (!googleStorageReady || !GOOGLE_DRIVE_FOLDER_ID) {
+    return { photoUrl: photoDataUrl, photoFileId: "" };
+  }
+
+  const { mimeType, ext, buffer } = parseDataUrl(photoDataUrl);
+  const safeName = `${record.dateKey}_g${record.grade}_r${record.room}_${record.studentId}_${Date.now()}.${ext}`.replace(/[^a-zA-Z0-9_.-]/g, "_");
+
+  const file = await driveClient.files.create({
+    requestBody: {
+      name: safeName,
+      parents: [GOOGLE_DRIVE_FOLDER_ID],
+      mimeType
+    },
+    media: {
+      mimeType,
+      body: Readable.from(buffer)
+    },
+    fields: "id,name,webViewLink,webContentLink"
+  });
+
+  const fileId = file.data.id;
+  try {
+    await driveClient.permissions.create({
+      fileId,
+      requestBody: { type: "anyone", role: "reader" }
+    });
+  } catch (err) {
+    console.warn("Could not set Drive public permission:", err.message);
+  }
+
+  return {
+    photoFileId: fileId,
+    photoUrl: `https://drive.google.com/thumbnail?id=${fileId}&sz=w1200`,
+    photoViewUrl: file.data.webViewLink || `https://drive.google.com/file/d/${fileId}/view`
+  };
+}
+
 function normalizeCaptureMode(value) {
   const mode = clean(value);
   const allowed = new Set(["mobile_camera", "gallery_upload", "photo_file", "attachment", "camera"]);
@@ -303,7 +602,6 @@ async function handleAction(body = {}) {
     const loginId = clean(body.loginId || body.studentId || body.username);
     const password = String(body.password || "");
 
-    // แอดมินเป็นบัญชีระบบ ไม่ใช่แถวนักเรียน จึงไม่ถูกสร้าง/แสดงใน users
     if (isAdminLogin(loginId)) {
       if (password !== ADMIN_PASSWORD) throw new Error("รหัสผ่านผู้ดูแลระบบไม่ถูกต้อง");
       const admin = systemAdmin();
@@ -333,6 +631,7 @@ async function handleAction(body = {}) {
     const countInRoom = users.filter((u) => u.active !== false && u.role === "student" && u.grade === grade && u.room === room).length;
     if (countInRoom >= Number(settings.maxUsersPerRoom || 60)) throw new Error("ห้องนี้มีสมาชิกครบตามจำนวนที่ตั้งไว้แล้ว");
 
+    const now = new Date().toISOString();
     const user = {
       userId: id("u"),
       studentId,
@@ -341,10 +640,14 @@ async function handleAction(body = {}) {
       grade,
       room,
       role: "student",
-      active: true
+      active: true,
+      createdAt: now,
+      updatedAt: now
     };
     users.push(user);
     getDutiesForRoom(grade, room);
+    await persist("users");
+    await persist("duties");
     const token = createToken(user);
     emitChange({ dateKey: todayKey(), grade, room, type: "user_registered" });
     return { ok: true, token, user: publicUser(user), settings: { ...settings } };
@@ -400,6 +703,7 @@ async function handleAction(body = {}) {
       existing.status = "assigned";
       existing.note = "";
       existing.photoUrl = "";
+      existing.photoFileId = "";
       existing.submittedAt = "";
       existing.reviewedAt = "";
       existing.updatedAt = now;
@@ -419,6 +723,7 @@ async function handleAction(body = {}) {
         status: "assigned",
         note: "",
         photoUrl: "",
+        photoFileId: "",
         selectedAt: now,
         submittedAt: "",
         reviewedAt: "",
@@ -427,6 +732,7 @@ async function handleAction(body = {}) {
       records.push(record);
     }
 
+    await persist("records");
     emitChange({ dateKey, grade, room, type: "duty_selected", record: publicRecord(record) });
     return { ok: true, record: publicRecord(record) };
   }
@@ -446,8 +752,11 @@ async function handleAction(body = {}) {
     if (record.status === "done" || record.status === "reviewed") throw new Error("งานนี้ส่งรูปแล้ว ต้องให้แอดมินกดแก้ก่อน");
 
     const now = new Date().toISOString();
+    const upload = await uploadProofToDrive({ photoDataUrl, record, user });
     record.note = note;
-    record.photoUrl = photoDataUrl;
+    record.photoUrl = upload.photoUrl;
+    record.photoFileId = upload.photoFileId || "";
+    record.photoViewUrl = upload.photoViewUrl || "";
     record.status = "done";
     record.captureMode = captureMode;
     record.captureClientAt = clean(body.captureClientAt);
@@ -455,6 +764,7 @@ async function handleAction(body = {}) {
     record.submittedAt = now;
     record.updatedAt = now;
 
+    await persist("records");
     emitChange({ dateKey: record.dateKey, grade: record.grade, room: record.room, type: "proof_uploaded", record: publicRecord(record) });
     return { ok: true, record: publicRecord(record) };
   }
@@ -467,6 +777,7 @@ async function handleAction(body = {}) {
     record.status = "reviewed";
     record.reviewedAt = new Date().toISOString();
     record.updatedAt = record.reviewedAt;
+    await persist("records");
     emitChange({ dateKey: record.dateKey, grade: record.grade, room: record.room, type: "duty_updated_by_admin", record: publicRecord(record) });
     return { ok: true, record: publicRecord(record) };
   }
@@ -477,6 +788,7 @@ async function handleAction(body = {}) {
     if (!record) throw new Error("ไม่พบรายการเวร");
     record.status = "rework";
     record.updatedAt = new Date().toISOString();
+    await persist("records");
     emitChange({ dateKey: record.dateKey, grade: record.grade, room: record.room, type: "duty_updated_by_admin", record: publicRecord(record) });
     return { ok: true, record: publicRecord(record) };
   }
@@ -497,6 +809,7 @@ async function handleAction(body = {}) {
       slots: Math.max(1, Math.min(99, Number(d.slots || 1)))
     }));
     dutyMap.set(roomDutyKey(grade, room), normalized);
+    await persist("duties");
     emitChange({ dateKey: todayKey(), grade, room, type: "duties_saved" });
     return { ok: true, duties: normalized };
   }
@@ -506,6 +819,8 @@ async function handleAction(body = {}) {
     const user = users.find((u) => u.userId === clean(body.userId) && u.role === "student");
     if (!user) throw new Error("ไม่พบบัญชีนักเรียน");
     user.password = "1234";
+    user.updatedAt = new Date().toISOString();
+    await persist("users");
     return { ok: true };
   }
 
@@ -514,6 +829,8 @@ async function handleAction(body = {}) {
     const user = users.find((u) => u.userId === clean(body.userId) && u.role === "student");
     if (!user) throw new Error("ไม่พบบัญชีนักเรียน");
     user.active = false;
+    user.updatedAt = new Date().toISOString();
+    await persist("users");
     emitChange({ dateKey: todayKey(), grade: user.grade, room: user.room, type: "user_deleted" });
     return { ok: true };
   }
@@ -525,6 +842,7 @@ async function handleAction(body = {}) {
     ["openHour", "openMinute", "closeHour", "closeMinute", "maxUsersPerRoom"].forEach((key) => {
       if (incoming[key] !== undefined) settings[key] = Number(incoming[key]);
     });
+    await persist("settings");
     io.emit("appDataChanged", { type: "settings_updated", scope: {}, data: null });
     return { ok: true, settings: { ...settings } };
   }
@@ -540,6 +858,7 @@ async function handleAction(body = {}) {
       if (match) removed.push(r);
       return !match;
     });
+    await persist("records");
     if (grade && room) emitChange({ dateKey, grade, room, type: "today_reset" });
     else io.to("admin").emit("appDataChanged", { type: "today_reset", scope: { dateKey, grade, room }, data: null });
     return { ok: true, removed: removed.length };
@@ -558,13 +877,17 @@ app.get("/", (req, res) => {
     realtime: "Socket.IO ready",
     status: "running",
     api: "Apps Script compatible action API ready",
-    version: "4.0.0-no-admin-in-users",
-    adminStorage: "system-only"
+    version: "6.0.0-google-sheets-drive",
+    adminStorage: "system-only",
+    storage: googleStorageReady ? "google-sheets-drive" : "memory-fallback",
+    sheetId: GOOGLE_SHEET_ID,
+    driveFolderId: GOOGLE_DRIVE_FOLDER_ID,
+    storageError: googleStorageReady ? "" : googleInitError
   });
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, serverTime: new Date().toISOString() });
+  res.json({ ok: true, serverTime: new Date().toISOString(), storage: googleStorageReady ? "google-sheets-drive" : "memory-fallback", storageError: googleStorageReady ? "" : googleInitError });
 });
 
 app.post("/", async (req, res) => {
@@ -585,7 +908,6 @@ app.post("/api", async (req, res) => {
   }
 });
 
-// REST endpoint เผื่อทดสอบง่าย
 app.get("/api/room-progress", (req, res) => {
   const grade = clean(req.query.grade);
   const room = clean(req.query.room);
@@ -618,6 +940,28 @@ io.on("connection", (socket) => {
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`PPK Duty Node Backend running on port ${PORT}`);
+async function boot() {
+  await initGoogleClients();
+  if (googleStorageReady) {
+    await loadFromSheets();
+    await saveSettings();
+  } else {
+    console.warn("Google storage is not ready; using memory fallback:", googleInitError);
+    if (SEED_DEMO) {
+      users.push(
+        { userId: "u_demo_10001", studentId: "10001", password: "1234", name: "นักเรียนทดสอบ 1", grade: "6", room: "1", role: "student", active: true, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+        { userId: "u_demo_10002", studentId: "10002", password: "1234", name: "นักเรียนทดสอบ 2", grade: "6", room: "1", role: "student", active: true, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+      );
+    }
+  }
+
+  server.listen(PORT, () => {
+    console.log(`PPK Duty Node backend running on port ${PORT}`);
+    console.log(`Storage mode: ${googleStorageReady ? "google-sheets-drive" : "memory-fallback"}`);
+  });
+}
+
+boot().catch((err) => {
+  console.error("Fatal boot error:", err);
+  process.exit(1);
 });
